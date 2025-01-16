@@ -38,6 +38,7 @@ cfg_cls = dict(
             num_blocks=(1,),
             num_channels=(32,),
             fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage2=dict(
             num_modules=1,
@@ -45,7 +46,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(2, 2),
             num_channels=(16, 32),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage3=dict(
             num_modules=1,
@@ -53,7 +55,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(2, 2, 2),
             num_channels=(16, 32, 64),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage4=dict(
             num_modules=1,
@@ -62,6 +65,7 @@ cfg_cls = dict(
             num_blocks=(2, 2, 2, 2),
             num_channels=(16, 32, 64, 128),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -74,6 +78,7 @@ cfg_cls = dict(
             num_blocks=(2,),
             num_channels=(64,),
             fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage2=dict(
             num_modules=1,
@@ -81,7 +86,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(2, 2),
             num_channels=(18, 36),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage3=dict(
             num_modules=3,
@@ -89,7 +95,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(2, 2, 2),
             num_channels=(18, 36, 72),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage4=dict(
             num_modules=2,
@@ -98,6 +105,7 @@ cfg_cls = dict(
             num_blocks=(2, 2, 2, 2),
             num_channels=(18, 36, 72, 144),
             fuse_method='SUM',
+            multi_scale_output=False,
         ),
     ),
 
@@ -110,6 +118,7 @@ cfg_cls = dict(
             num_blocks=(4,),
             num_channels=(64,),
             fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage2=dict(
             num_modules=1,
@@ -117,7 +126,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(4, 4),
             num_channels=(18, 36),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage3=dict(
             num_modules=4,
@@ -125,7 +135,8 @@ cfg_cls = dict(
             block_type='BASIC',
             num_blocks=(4, 4, 4),
             num_channels=(18, 36, 72),
-            fuse_method='SUM'
+            fuse_method='SUM',
+            multi_scale_output=True,
         ),
         stage4=dict(
             num_modules=3,
@@ -134,6 +145,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(18, 36, 72, 144),
             fuse_method='SUM',
+            multi_scale_output=False,
         ),
     ),
 
@@ -170,6 +182,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(30, 60, 120, 240),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -206,6 +219,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(32, 64, 128, 256),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -242,6 +256,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(40, 80, 160, 320),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -278,6 +293,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(44, 88, 176, 352),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -314,6 +330,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(48, 96, 192, 384),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     ),
 
@@ -350,6 +367,7 @@ cfg_cls = dict(
             num_blocks=(4, 4, 4, 4),
             num_channels=(64, 128, 256, 512),
             fuse_method='SUM',
+            multi_scale_output=False
         ),
     )
 )
@@ -697,6 +715,9 @@ class HighResolutionNet(nn.Module):
         num_channels = layer_config['num_channels']
         block_type = block_types_dict[layer_config['block_type']]
         fuse_method = layer_config['fuse_method']
+        
+        # override the multi scale output block if the config has it. 
+        multi_scale_output = layer_config.get('multi_scale_output', multi_scale_output)
 
         modules = []
         for i in range(num_modules):
