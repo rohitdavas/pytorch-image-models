@@ -1,9 +1,10 @@
-from typing import Optional
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .attention import maybe_add_mask
 from .config import use_fused_attn
 from .mlp import Mlp
 from .weight_init import trunc_normal_tf_
@@ -28,7 +29,8 @@ class AttentionPoolLatent(nn.Module):
             latent_dim: int = None,
             pos_embed: str = '',
             pool_type: str = 'token',
-            norm_layer: Optional[nn.Module] = None,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            act_layer: Optional[Type[nn.Module]] = nn.GELU,
             drop: float = 0.0,
     ):
         super().__init__()
@@ -54,13 +56,18 @@ class AttentionPoolLatent(nn.Module):
 
         self.q = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
         self.kv = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        if qk_norm:
+            qk_norm_layer = norm_layer or nn.LayerNorm
+            self.q_norm = qk_norm_layer(self.head_dim)
+            self.k_norm = qk_norm_layer(self.head_dim)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(drop)
 
         self.norm = norm_layer(out_features) if norm_layer is not None else nn.Identity()
-        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio))
+        self.mlp = Mlp(embed_dim, int(embed_dim * mlp_ratio), act_layer=act_layer)
 
         self.init_weights()
 
@@ -69,7 +76,7 @@ class AttentionPoolLatent(nn.Module):
             trunc_normal_tf_(self.pos_embed, std=self.pos_embed.shape[1] ** -0.5)
         trunc_normal_tf_(self.latent, std=self.latent_dim ** -0.5)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask: Optional[torch.Tensor] = None):
         B, N, C = x.shape
 
         if self.pos_embed is not None:
@@ -85,10 +92,11 @@ class AttentionPoolLatent(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v)
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            attn = maybe_add_mask(attn, attn_mask)
             attn = attn.softmax(dim=-1)
             x = attn @ v
         x = x.transpose(1, 2).reshape(B, self.latent_len, C)

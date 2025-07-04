@@ -1,6 +1,6 @@
 """ EVA
 
-EVA from https://github.com/baaivision/EVA , paper: https://arxiv.org/abs/2211.07636
+EVA ViT from https://github.com/baaivision/EVA , paper: https://arxiv.org/abs/2211.07636
 
 @article{EVA,
   title={EVA: Exploring the Limits of Masked Visual Representation Learning at Scale},
@@ -18,14 +18,36 @@ EVA-02: A Visual Representation for Neon Genesis - https://arxiv.org/abs/2303.11
   year={2023}
 }
 
-This file contains EVA & EVA02 model implementations evolved from BEiT, additional models in vision_transformer.py.
+@article{bolya2025perception,
+  title={Perception encoder: The best visual embeddings are not at the output of the network},
+  author={Bolya, Daniel and Huang, Po-Yao and Sun, Peize and Cho, Jang Hyun and Madotto, Andrea and Wei, Chen and Ma,
+    Tengyu and Zhi, Jiale and Rajasegaran, Jathushan and Rasheed, Hanoona and others},
+  journal={arXiv preprint arXiv:2504.13181},
+  year={2025}
+}
+
+@inproceedings{heo2024rotary,
+  title={Rotary position embedding for vision transformer},
+  author={Heo, Byeongho and Park, Song and Han, Dongyoon and Yun, Sangdoo},
+  booktitle={European Conference on Computer Vision},
+  pages={289--305},
+  year={2024},
+  organization={Springer}
+}
+
+This file contains a number of ViT variants the utilise ROPE position embeddings, SwiGLU and other additions:
+ * EVA & EVA02 model implementations that evolved from BEiT, additional models in vision_transformer.py.
+ * `timm` original SBB ViT w/ ROPE position embeddings
+ * Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)
+ * ROPE-ViT from Naver AI (https://arxiv.org/abs/2403.13298)
 
 Modifications by / Copyright 2023 Ross Wightman, original copyrights below
 """
 # EVA models Copyright (c) 2022 BAAI-Vision
 # EVA02 models Copyright (c) 2023 BAAI-Vision
 import math
-from typing import Callable, List, Optional, Tuple, Union
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -33,8 +55,9 @@ import torch.nn.functional as F
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import PatchEmbed, Mlp, GluMlp, SwiGLU, LayerNorm, DropPath, PatchDropout, RotaryEmbeddingCat, \
-    apply_rot_embed_cat, apply_keep_indices_nlc, trunc_normal_, resample_patch_embed, resample_abs_pos_embed, \
-    to_2tuple, use_fused_attn
+    RotaryEmbeddingMixed, apply_rot_embed_cat, apply_keep_indices_nlc, trunc_normal_, \
+    resample_patch_embed, resample_abs_pos_embed, global_pool_nlc, to_2tuple, use_fused_attn, AttentionRope, \
+    AttentionPoolLatent
 
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
@@ -45,6 +68,8 @@ __all__ = ['Eva']
 
 
 class EvaAttention(nn.Module):
+    """ EVA Attention with ROPE, no k-bias, and fused/unfused qkv options
+    """
     fused_attn: torch.jit.Final[bool]
 
     def __init__(
@@ -53,55 +78,64 @@ class EvaAttention(nn.Module):
             num_heads: int = 8,
             qkv_bias: bool = True,
             qkv_fused: bool = True,
-            num_prefix_tokens: int = 1,
             qkv_bias_separate: bool = False,
+            num_prefix_tokens: int = 1,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
+            qk_norm: bool = False,
+            scale_norm: bool = True,
     ):
         """
-
         Args:
-            dim:
-            num_heads:
-            qkv_bias:
-            qkv_fused:
-            attn_drop:
-            proj_drop:
-            attn_head_dim:
-            norm_layer:
+            dim: Input dimension of the token embeddings
+            num_heads: Number of attention heads
+            qkv_bias: Whether to add a bias term to the query, key, and value projections
+            qkv_fused: Whether qkv projections are fused into one projection or separate
+            qkv_bias_separate: Whether to apply bias to qkv as a separate addition or part of F.linear() call
+            num_prefix_tokens: Number of reg/cls tokens at the beginning of the sequence that
+                should not have position embeddings applied
+            attn_drop: Dropout rate for attention weights
+            proj_drop: Dropout rate for the output projection
+            attn_head_dim: Dimension of each attention head (if None, computed as dim // num_heads)
+            norm_layer: Normalization layer constructor to use for QK and scale normalization
+            qk_norm: Enable normalization of query (Q) and key (K) vectors with norm_layer
+            scale_norm: Enable normalization (scaling) of attention output with norm_layer
         """
         super().__init__()
+        if scale_norm or qk_norm:
+            assert norm_layer is not None, 'norm_layer must be provided if qk_norm or scale_norm is True'
         self.num_heads = num_heads
         head_dim = dim // num_heads
         if attn_head_dim is not None:
             head_dim = attn_head_dim
-        all_head_dim = head_dim * self.num_heads
+        attn_dim = head_dim * self.num_heads
         self.scale = head_dim ** -0.5
         self.num_prefix_tokens = num_prefix_tokens
         self.fused_attn = use_fused_attn()
         self.qkv_bias_separate = qkv_bias_separate
 
         if qkv_fused:
-            self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
+            self.qkv = nn.Linear(dim, attn_dim * 3, bias=False)
             self.q_proj = self.k_proj = self.v_proj = None
             if qkv_bias:
-                self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
-                self.register_buffer('k_bias', torch.zeros(all_head_dim), persistent=False)
-                self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
+                self.q_bias = nn.Parameter(torch.zeros(attn_dim))
+                self.register_buffer('k_bias', torch.zeros(attn_dim), persistent=False)
+                self.v_bias = nn.Parameter(torch.zeros(attn_dim))
             else:
                 self.q_bias = self.k_bias = self.v_bias = None
         else:
-            self.q_proj = nn.Linear(dim, all_head_dim, bias=qkv_bias)
-            self.k_proj = nn.Linear(dim, all_head_dim, bias=False)
-            self.v_proj = nn.Linear(dim, all_head_dim, bias=qkv_bias)
+            self.q_proj = nn.Linear(dim, attn_dim, bias=qkv_bias)
+            self.k_proj = nn.Linear(dim, attn_dim, bias=False)
+            self.v_proj = nn.Linear(dim, attn_dim, bias=qkv_bias)
             self.qkv = None
             self.q_bias = self.k_bias = self.v_bias = None
-
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
-        self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
-        self.proj = nn.Linear(all_head_dim, dim)
+        self.norm = norm_layer(attn_dim) if scale_norm else nn.Identity()
+        self.proj = nn.Linear(attn_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
@@ -110,6 +144,16 @@ class EvaAttention(nn.Module):
             rope: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
     ):
+        """Forward pass for the attention module.
+
+        Args:
+            x: Input tensor of shape (batch_size, sequence_length, embedding_dim)
+            rope: Rotary position embeddings tensor for position-aware attention
+            attn_mask: Optional attention mask to apply during attention computation
+
+        Returns:
+            Tensor of shape (batch_size, sequence_length, embedding_dim)
+        """
         B, N, C = x.shape
 
         if self.qkv is not None:
@@ -129,6 +173,8 @@ class EvaAttention(nn.Module):
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
 
+        q, k = self.q_norm(q), self.k_norm(k)
+
         if rope is not None:
             npt = self.num_prefix_tokens
             q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
@@ -143,12 +189,12 @@ class EvaAttention(nn.Module):
         else:
             q = q * self.scale
             attn = (q @ k.transpose(-2, -1))
-            
+
             if attn_mask is not None:
                 attn_mask = attn_mask.to(torch.bool)
                 attn = attn.masked_fill(~attn_mask[:, None, None, :], float("-inf"))
             attn = attn.softmax(dim=-1)
-            
+
             attn = self.attn_drop(attn)
             x = attn @ v
 
@@ -172,6 +218,7 @@ class EvaBlock(nn.Module):
             scale_mlp: bool = False,
             scale_attn_inner: bool = False,
             num_prefix_tokens: int = 1,
+            attn_type: str = 'eva',
             proj_drop: float = 0.,
             attn_drop: float = 0.,
             drop_path: float = 0.,
@@ -180,28 +227,31 @@ class EvaBlock(nn.Module):
             norm_layer: Callable = LayerNorm,
             attn_head_dim: Optional[int] = None,
     ):
-        """
+        """ Initialize the EVA transformer block.
 
         Args:
-            dim:
-            num_heads:
-            qkv_bias:
-            qkv_fused:
-            mlp_ratio:
-            swiglu_mlp:
-            scale_mlp:
-            scale_attn_inner:
-            proj_drop:
-            attn_drop:
-            drop_path:
-            init_values:
-            act_layer:
-            norm_layer:
-            attn_head_dim:
+          dim: Input dimension of the token embeddings
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias terms in query, key, value projections
+            qkv_fused: Whether to use a single projection for query, key, value
+            mlp_ratio: Ratio of MLP hidden dimension to input dimension
+            swiglu_mlp: Whether to use SwiGLU activation in the MLP
+            scale_mlp: Whether to use normalization in the MLP
+            scale_attn_inner: Whether to use normalization within the attention mechanism
+            num_prefix_tokens: Number of tokens at the beginning of the sequence (class tokens, etc.)
+            attn_type: Type of attention module to use ('eva' or 'rope')
+            proj_drop: Dropout rate for projection layers
+            attn_drop: Dropout rate for attention matrix
+            drop_path: Stochastic depth rate
+            init_values: Initial value for LayerScale, None = no LayerScale
+            act_layer: Activation layer constructor
+            norm_layer: Normalization layer constructor
+            attn_head_dim: Dimension of each attention head (if None, computed as dim // num_heads)
         """
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = EvaAttention(
+        attn_cls = AttentionRope if attn_type == 'rope' else EvaAttention
+        self.attn = attn_cls(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -210,7 +260,8 @@ class EvaBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             attn_head_dim=attn_head_dim,
-            norm_layer=norm_layer if scale_attn_inner else None,
+            norm_layer=norm_layer,
+            scale_norm=scale_attn_inner,
         )
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -266,6 +317,7 @@ class EvaBlockPostNorm(nn.Module):
             qkv_bias: bool = True,
             qkv_fused: bool = True,
             mlp_ratio: float = 4.,
+            attn_type: str = 'eva',
             swiglu_mlp: bool = False,
             scale_mlp: bool = False,
             scale_attn_inner: bool = False,
@@ -278,27 +330,30 @@ class EvaBlockPostNorm(nn.Module):
             norm_layer: Callable = nn.LayerNorm,
             attn_head_dim: Optional[int] = None,
     ):
-        """
+        """ Initialize the post-norm EVA transformer block.
 
         Args:
-            dim:
-            num_heads:
-            qkv_bias:
-            qkv_fused:
-            mlp_ratio:
-            swiglu_mlp:
-            scale_mlp:
-            scale_attn_inner:
-            proj_drop:
-            attn_drop:
-            drop_path:
-            init_values:
-            act_layer:
-            norm_layer:
-            attn_head_dim:
+          dim: Input dimension of the token embeddings
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias terms in query, key, value projections
+            qkv_fused: Whether to use a single projection for query, key, value
+            mlp_ratio: Ratio of MLP hidden dimension to input dimension
+            swiglu_mlp: Whether to use SwiGLU activation in the MLP
+            scale_mlp: Whether to use normalization in the MLP
+            scale_attn_inner: Whether to use normalization within the attention mechanism
+            num_prefix_tokens: Number of tokens at the beginning of the sequence (class tokens, etc.)
+            attn_type: Type of attention module to use ('eva' or 'rope')
+            proj_drop: Dropout rate for projection layers
+            attn_drop: Dropout rate for attention matrix
+            drop_path: Stochastic depth rate
+            init_values: Initial value for LayerScale, None = no LayerScale (NOTE: ignored for post-norm block)
+            act_layer: Activation layer constructor
+            norm_layer: Normalization layer constructor
+            attn_head_dim: Dimension of each attention head (if None, computed as dim // num_heads)
         """
         super().__init__()
-        self.attn = EvaAttention(
+        attn_cls = AttentionRope if attn_type == 'rope' else EvaAttention
+        self.attn = attn_cls(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -307,7 +362,8 @@ class EvaBlockPostNorm(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             attn_head_dim=attn_head_dim,
-            norm_layer=norm_layer if scale_attn_inner else None,
+            norm_layer=norm_layer,
+            scale_norm=scale_attn_inner,
         )
         self.norm1 = norm_layer(dim)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -373,6 +429,7 @@ class Eva(nn.Module):
             swiglu_mlp: bool = False,
             scale_mlp: bool = False,
             scale_attn_inner: bool = False,
+            attn_type: str = 'eva',
             drop_rate: float = 0.,
             pos_drop_rate: float = 0.,
             patch_drop_rate: float = 0.,
@@ -383,52 +440,90 @@ class Eva(nn.Module):
             init_values: Optional[float] = None,
             class_token: bool = True,
             num_reg_tokens: int = 0,
+            no_embed_class: bool = False,
             use_abs_pos_emb: bool = True,
             use_rot_pos_emb: bool = False,
+            rope_mixed_mode: bool = False,
+            rope_grid_offset: float = 0.,
+            rope_grid_indexing: str = 'ij',
+            rope_temperature: float = 10000.,
             use_post_norm: bool = False,
+            use_pre_transformer_norm: bool = False,
+            use_post_transformer_norm: Optional[bool] = None,
+            use_fc_norm: Optional[bool] = None,
+            attn_pool_num_heads: Optional[int] = None,
+            attn_pool_mlp_ratio: Optional[float] = None,
             dynamic_img_size: bool = False,
             dynamic_img_pad: bool = False,
             ref_feat_shape: Optional[Union[Tuple[int, int], int]] = None,
             head_init_scale: float = 0.001,
     ):
-        """
+        """Initialize the EVA Vision Transformer model.
 
         Args:
-            img_size:
-            patch_size:
-            in_chans:
-            num_classes:
-            global_pool:
-            embed_dim:
-            depth:
-            num_heads:
-            qkv_bias:
-            qkv_fused:
-            mlp_ratio:
-            swiglu_mlp:
-            scale_mlp:
-            scale_attn_inner:
-            drop_rate:
-            pos_drop_rate:
-            proj_drop_rate:
-            attn_drop_rate:
-            drop_path_rate:
-            norm_layer:
-            init_values:
-            class_token:
-            use_abs_pos_emb:
-            use_rot_pos_emb:
-            use_post_norm:
-            ref_feat_shape:
-            head_init_scale:
+            img_size: Input image size (single int for square, or tuple for rectangular)
+            patch_size: Patch size to divide image into tokens (single int for square, or tuple)
+            in_chans: Number of input image channels
+            num_classes: Number of classes (output dim) for classification head (final projection), 0 for pass-through
+            global_pool: Type of global pooling for final sequence ('avg', 'token', 'map', etc.)
+            embed_dim: Embedding dimension for tokens
+            depth: Number of transformer blocks
+            num_heads: Number of attention heads
+            qkv_bias: Enable bias for query, key, value projections
+            qkv_fused: Use a single projection for query, key, value
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim
+            swiglu_mlp: Use SwiGLU activation in MLP
+            scale_mlp: Apply scaling normalization in MLP (normformer style)
+            scale_attn_inner: Apply scaling normalization inside attention
+            attn_type: Type of attention module to use
+            drop_rate: Dropout rate after final projection and pooling
+            pos_drop_rate: Dropout rate for positional embeddings
+            patch_drop_rate: Rate of dropping patches during training
+            proj_drop_rate: Dropout rate for projections
+            attn_drop_rate: Dropout rate for attention
+            drop_path_rate: Stochastic depth rate
+            norm_layer: Normalization layer constructor
+            init_values: Initial layer-scale values
+            class_token: Use class token
+            num_reg_tokens: Number of additional learnable 'register' tokens to add to the sequence
+            no_embed_class: Don't include position embeddings for class (or reg) tokens
+            use_abs_pos_emb: Use absolute (learned) positional embeddings
+            use_rot_pos_emb: Use rotary position embeddings
+            rope_mixed_mode: Use mixed mode ROPE with per-layer learnable frequencies
+            rope_grid_offset: Offset for rotary position embedding grid
+            rope_grid_indexing: Indexing mode for rotary position embeddings ('ij' or 'xy')
+            rope_temperature: Temperature parameter for ROPE frequency computation
+            use_post_norm: Use post-norm transformer block type
+            use_pre_transformer_norm: Use normalization layer before transformer blocks
+            use_post_transformer_norm: Use normalization layer after transformer blocks
+            use_fc_norm: Use normalization layer after pooling, before final classifier
+            attn_pool_num_heads: Number of heads in attention pooling
+            attn_pool_mlp_ratio: MLP ratio in attention pooling
+            dynamic_img_size: Support dynamic image sizes in forward pass
+            dynamic_img_pad: Apply dynamic padding for irregular image sizes
+            ref_feat_shape: Reference feature shape for rotary position embedding scale
+            head_init_scale: Initialization scale for classification head weights
         """
         super().__init__()
+        assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
         self.num_prefix_tokens = (1 if class_token else 0) + num_reg_tokens
+        self.no_embed_class = no_embed_class
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = False
+
+        # resolve norm / pool usage
+        activate_pre_norm = use_pre_transformer_norm
+        if use_fc_norm is not None:
+            activate_fc_norm = use_fc_norm  # pass through if explicit
+        else:
+            activate_fc_norm = global_pool == 'avg'  # default on if avg pool used
+        if use_post_transformer_norm is not None:
+            activate_post_norm = use_post_transformer_norm  # pass through if explicit
+        else:
+            activate_post_norm = not activate_fc_norm  # default on if fc_norm isn't active
 
         embed_args = {}
         if dynamic_img_size:
@@ -440,6 +535,7 @@ class Eva(nn.Module):
             in_chans=in_chans,
             embed_dim=embed_dim,
             dynamic_img_pad=dynamic_img_pad,
+            bias=not use_pre_transformer_norm,
             **embed_args,
         )
         num_patches = self.patch_embed.num_patches
@@ -449,8 +545,8 @@ class Eva(nn.Module):
         self.reg_token = nn.Parameter(torch.zeros(1, num_reg_tokens, embed_dim)) if num_reg_tokens else None
         self.cls_embed = class_token and self.reg_token is None
 
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + self.num_prefix_tokens, embed_dim)) if use_abs_pos_emb else None
+        num_pos_tokens = num_patches if no_embed_class else num_patches + self.num_prefix_tokens
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_pos_tokens, embed_dim)) if use_abs_pos_emb else None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
         if patch_drop_rate > 0:
             self.patch_drop = PatchDropout(
@@ -463,14 +559,33 @@ class Eva(nn.Module):
 
         if use_rot_pos_emb:
             ref_feat_shape = to_2tuple(ref_feat_shape) if ref_feat_shape is not None else None
-            self.rope = RotaryEmbeddingCat(
-                embed_dim // num_heads,
-                in_pixels=False,
-                feat_shape=None if dynamic_img_size else self.patch_embed.grid_size,
-                ref_feat_shape=ref_feat_shape,
-            )
+            if rope_mixed_mode:
+                self.rope_mixed = True
+                # Mixed mode to supports depth-dependent frequencies
+                self.rope = RotaryEmbeddingMixed(
+                    dim=embed_dim,
+                    depth=depth,
+                    num_heads=num_heads,
+                    temperature=rope_temperature,
+                    feat_shape=None if dynamic_img_size else self.patch_embed.grid_size,
+                    grid_indexing=rope_grid_indexing,
+                )
+            else:
+                self.rope_mixed = False
+                self.rope = RotaryEmbeddingCat(
+                    dim=embed_dim // num_heads,
+                    temperature=rope_temperature,
+                    in_pixels=False,
+                    feat_shape=None if dynamic_img_size else self.patch_embed.grid_size,
+                    ref_feat_shape=ref_feat_shape,
+                    grid_offset=rope_grid_offset,
+                    grid_indexing=rope_grid_indexing,
+                )
         else:
+            self.rope_mixed = False
             self.rope = None
+
+        self.norm_pre = norm_layer(embed_dim) if activate_pre_norm else nn.Identity()
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         block_fn = EvaBlockPostNorm if use_post_norm else EvaBlock
@@ -484,6 +599,7 @@ class Eva(nn.Module):
                 swiglu_mlp=swiglu_mlp,
                 scale_mlp=scale_mlp,
                 scale_attn_inner=scale_attn_inner,
+                attn_type=attn_type,
                 num_prefix_tokens=self.num_prefix_tokens,
                 proj_drop=proj_drop_rate,
                 attn_drop=attn_drop_rate,
@@ -495,9 +611,21 @@ class Eva(nn.Module):
         self.feature_info = [
             dict(module=f'blocks.{i}', num_chs=embed_dim, reduction=r) for i in range(depth)]
 
-        use_fc_norm = self.global_pool == 'avg'
-        self.norm = nn.Identity() if use_fc_norm else norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_fc_norm else nn.Identity()
+        self.norm =  norm_layer(embed_dim) if activate_post_norm else nn.Identity()
+
+        if global_pool == 'map':
+            attn_pool_num_heads = attn_pool_num_heads or num_heads
+            attn_pool_mlp_ratio = attn_pool_mlp_ratio or mlp_ratio
+            self.attn_pool = AttentionPoolLatent(
+                self.embed_dim,
+                num_heads=attn_pool_num_heads,
+                mlp_ratio=attn_pool_mlp_ratio,
+                norm_layer=norm_layer,
+                act_layer=nn.GELU,
+            )
+        else:
+            self.attn_pool = None
+        self.fc_norm = norm_layer(embed_dim) if activate_fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
@@ -515,7 +643,8 @@ class Eva(nn.Module):
             self.head.weight.data.mul_(head_init_scale)
             self.head.bias.data.mul_(head_init_scale)
 
-    def fix_init_weight(self):
+    def fix_init_weight(self) -> None:
+        """Fix initialization weights by rescaling based on layer depth."""
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
 
@@ -523,23 +652,33 @@ class Eva(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def _init_weights(self, m):
+    def _init_weights(self, m: nn.Module) -> None:
+        """Initialize weights for Linear layers.
+
+        Args:
+            m: Module to initialize.
+        """
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
     @torch.jit.ignore
-    def no_weight_decay(self):
+    def no_weight_decay(self) -> Set[str]:
+        """Parameters to exclude from weight decay."""
         nwd = {'pos_embed', 'cls_token'}
+        if (rope := getattr(self, "rope", None)) and hasattr(rope, "no_weight_decay"):
+            return nwd | {f"rope.{p}" for p in rope.no_weight_decay()}
         return nwd
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        """Enable or disable gradient checkpointing."""
         self.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def group_matcher(self, coarse=False):
+    def group_matcher(self, coarse: bool = False) -> Dict[str, Any]:
+        """Create layer groupings for optimization."""
         matcher = dict(
             stem=r'^cls_token|pos_embed|patch_embed',  # stem and embed
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))],
@@ -550,7 +689,13 @@ class Eva(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+        """Reset the classifier head.
+
+        Args:
+            num_classes: Number of output classes.
+            global_pool: Global pooling type.
+        """
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
@@ -565,7 +710,7 @@ class Eva(nn.Module):
                     self.pos_embed,
                     new_size=(H, W),
                     old_size=prev_grid_size,
-                    num_prefix_tokens=self.num_prefix_tokens,
+                    num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
                 )
             else:
                 pos_embed = None
@@ -575,18 +720,24 @@ class Eva(nn.Module):
             pos_embed = self.pos_embed
             rot_pos_embed = self.rope.get_embed() if self.rope is not None else None
 
+        to_cat = []
         if self.cls_token is not None:
-            x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-
-        if pos_embed is not None:
-            x = x + pos_embed
-
+            to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
         if self.reg_token is not None:
-            to_cat = []
-            if self.cls_token is not None:
-                to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
             to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
-            x = torch.cat(to_cat + [x], dim=1)
+
+        if self.no_embed_class:
+            # position embedding does not overlap with class / reg token
+            if pos_embed is not None:
+                x = x + pos_embed
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
+        else:
+            # pos_embed has entry for class / reg token, concat then add
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
+            if pos_embed is not None:
+                x = x + pos_embed
 
         x = self.pos_drop(x)
 
@@ -626,14 +777,28 @@ class Eva(nn.Module):
         B, _, height, width = x.shape
         x = self.patch_embed(x)
         x, rot_pos_embed = self._pos_embed(x)
+        x = self.norm_pre(x)
         if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
             blocks = self.blocks
         else:
             blocks = self.blocks[:max_index + 1]
-        for i, blk in enumerate(blocks):
-            x = blk(x, rope=rot_pos_embed)
-            if i in take_indices:
-                intermediates.append(self.norm(x) if norm else x)
+        # Handle depth-dependent embeddings for mixed mode
+        if getattr(self, 'rope_mixed', False) and rot_pos_embed is not None:
+            for i, blk in enumerate(blocks):
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    x = checkpoint(blk, x, rope=rot_pos_embed[i])
+                else:
+                    x = blk(x, rope=rot_pos_embed[i])
+                if i in take_indices:
+                    intermediates.append(self.norm(x) if norm else x)
+        else:
+            for i, blk in enumerate(blocks):
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    x = checkpoint(blk, x, rope=rot_pos_embed)
+                else:
+                    x = blk(x, rope=rot_pos_embed)
+                if i in take_indices:
+                    intermediates.append(self.norm(x) if norm else x)
 
         # process intermediates
         if self.num_prefix_tokens:
@@ -668,46 +833,180 @@ class Eva(nn.Module):
         if prune_norm:
             self.norm = nn.Identity()
         if prune_head:
+            self.attn_pool = None
             self.fc_norm = nn.Identity()
             self.reset_classifier(0, '')
         return take_indices
 
-    def forward_features(self, x):
+    def pool(self, x: torch.Tensor, pool_type: Optional[str] = None) -> torch.Tensor:
+        if self.attn_pool is not None:
+            x = self.attn_pool(x)
+            return x
+        pool_type = self.global_pool if pool_type is None else pool_type
+        x = global_pool_nlc(x, pool_type=pool_type, num_prefix_tokens=self.num_prefix_tokens)
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through feature extraction layers.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Feature tensor.
+        """
         x = self.patch_embed(x)
         x, rot_pos_embed = self._pos_embed(x)
-        for blk in self.blocks:
-            if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed)
-            else:
-                x = blk(x, rope=rot_pos_embed)
+        x = self.norm_pre(x)
+
+        # Handle depth-dependent embeddings for mixed mode
+        if getattr(self, 'rope_mixed', False) and rot_pos_embed is not None:
+            # rot_pos_embed has shape (depth, H*W, dim) for mixed mode
+            for i, blk in enumerate(self.blocks):
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    x = checkpoint(blk, x, rope=rot_pos_embed[i])
+                else:
+                    x = blk(x, rope=rot_pos_embed[i])
+        else:
+            # Standard path for non-mixed mode
+            for blk in self.blocks:
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    x = checkpoint(blk, x, rope=rot_pos_embed)
+                else:
+                    x = blk(x, rope=rot_pos_embed)
+
         x = self.norm(x)
         return x
 
-    def forward_head(self, x, pre_logits: bool = False):
-        if self.global_pool:
-            x = x[:, self.num_prefix_tokens:].mean(dim=1) if self.global_pool == 'avg' else x[:, 0]
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through classifier head.
+
+        Args:
+            x: Feature tensor.
+            pre_logits: Return pre-logits if True.
+
+        Returns:
+            Output tensor.
+        """
+        x = self.pool(x)
         x = self.fc_norm(x)
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor.
+        """
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
 
 
-def checkpoint_filter_fn(
-        state_dict,
-        model,
-        interpolation='bicubic',
-        antialias=True,
-):
-    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+def _convert_pe(
+    state_dict: Dict[str, torch.Tensor],
+    model: nn.Module,
+    prefix: str = 'visual.',
+) -> Dict[str, torch.Tensor]:
+    """Convert Perception Encoder weights.
+
+    Args:
+        state_dict: State dictionary to convert.
+        model: Target model instance.
+        prefix: Prefix to strip from keys.
+
+    Returns:
+        Converted state dictionary.
+    """
+    state_dict = state_dict.get('model', state_dict)
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
     out_dict = {}
+    swaps = [
+        ('conv1', 'patch_embed.proj'),
+        ('positional_embedding', 'pos_embed'),
+        ('transformer.resblocks.', 'blocks.'),
+        ('ln_pre', 'norm_pre'),
+        ('ln_post', 'norm'),
+        ('ln_', 'norm'),
+        ('ls_1.gamma', 'gamma_1'),
+        ('ls_2.gamma', 'gamma_2'),
+        ('in_proj_', 'qkv.'),
+        ('out_proj', 'proj'),
+        ('mlp.c_fc', 'mlp.fc1'),
+        ('mlp.c_proj', 'mlp.fc2'),
+    ]
+    len_prefix = len(prefix)
+    for k, v in state_dict.items():
+        if prefix:
+            if not k.startswith(prefix):
+                continue
+            k = k[len_prefix:]
+
+        for sp in swaps:
+            k = k.replace(sp[0], sp[1])
+
+        if k.startswith('attn_pool'):
+            k = k.replace('attn_pool.attn', 'attn_pool')
+            k = k.replace('attn_pool.layernorm', 'attn_pool.norm')
+            k = k.replace('attn_pool.probe', 'attn_pool.latent')
+            if k.startswith('attn_pool.qkv'):
+                dim = v.shape[0] // 3
+                if k.endswith('weight'):
+                    out_dict['attn_pool.q.weight'] = v[:dim]
+                    out_dict['attn_pool.kv.weight'] = v[dim:]
+                elif k.endswith('bias'):
+                    out_dict['attn_pool.q.bias'] = v[:dim]
+                    out_dict['attn_pool.kv.bias'] = v[dim:]
+                continue
+        elif k == 'proj':
+            k = 'head.weight'
+            v = v.transpose(0, 1)
+            out_dict['head.bias'] = torch.zeros(v.shape[0])
+        elif k == 'class_embedding':
+            k = 'cls_token'
+            v = v.unsqueeze(0).unsqueeze(1)
+        elif k == 'pos_embed':
+            v = v.unsqueeze(0)
+        out_dict[k] = v
+
+    return out_dict
+
+
+def checkpoint_filter_fn(
+        state_dict: Dict[str, torch.Tensor],
+        model: nn.Module,
+        interpolation: str = 'bicubic',
+        antialias: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Convert patch embedding weight from manual patchify + linear proj to conv.
+
+    Args:
+        state_dict: Checkpoint state dictionary.
+        model: Target model instance.
+        interpolation: Interpolation method for resizing.
+        antialias: Whether to use antialiasing when resizing.
+
+    Returns:
+        Filtered state dictionary.
+    """
+    out_dict = {}
+    # Standard EVA checkpoint processing
     state_dict = state_dict.get('model_ema', state_dict)
     state_dict = state_dict.get('model', state_dict)
     state_dict = state_dict.get('module', state_dict)
     state_dict = state_dict.get('state_dict', state_dict)
+
+    # Loading Meta PE (Perception Encoder) weights
+    if 'visual.conv1.weight' in state_dict:
+        return _convert_pe(state_dict, model)
+    elif 'conv1.weight' in state_dict:
+        return _convert_pe(state_dict, model, prefix='')
+
     # prefix for loading OpenCLIP compatible weights
     if 'visual.trunk.pos_embed' in state_dict:
         prefix = 'visual.trunk.'
@@ -721,12 +1020,11 @@ def checkpoint_filter_fn(
     len_prefix = len(prefix)
     for k, v in state_dict.items():
         if prefix:
-            if k.startswith(prefix):
-                k = k[len_prefix:]
-            else:
+            if not k.startswith(prefix):
                 continue
+            k = k[len_prefix:]
 
-        if 'rope' in k:
+        if 'rope' in k and not k == 'rope.freqs':
             # fixed embedding no need to load buffer from checkpoint
             continue
 
@@ -775,7 +1073,17 @@ def checkpoint_filter_fn(
     return out_dict
 
 
-def _create_eva(variant, pretrained=False, **kwargs):
+def _create_eva(variant: str, pretrained: bool = False, **kwargs) -> Eva:
+    """Create an EVA model.
+
+    Args:
+        variant: Model variant name.
+        pretrained: Load pretrained weights.
+        **kwargs: Additional model arguments.
+
+    Returns:
+        Instantiated Eva model.
+    """
     out_indices = kwargs.pop('out_indices', 3)
     model = build_model_with_cfg(
         Eva, variant, pretrained,
@@ -786,7 +1094,16 @@ def _create_eva(variant, pretrained=False, **kwargs):
     return model
 
 
-def _cfg(url='', **kwargs):
+def _cfg(url: str = '', **kwargs) -> Dict[str, Any]:
+    """Generate default configuration for EVA models.
+
+    Args:
+        url: Model weights URL.
+        **kwargs: Additional configuration parameters.
+
+    Returns:
+        Model configuration dictionary.
+    """
     return {
         'url': url,
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
@@ -794,6 +1111,26 @@ def _cfg(url='', **kwargs):
         'mean': OPENAI_CLIP_MEAN, 'std': OPENAI_CLIP_STD,
         'first_conv': 'patch_embed.proj', 'classifier': 'head',
         'license': 'mit', **kwargs
+    }
+
+
+def _pe_cfg(url: str = '', **kwargs) -> Dict[str, Any]:
+    """Generate default configuration for Perception Encoder models.
+
+    Args:
+        url: Model weights URL.
+        **kwargs: Additional configuration parameters.
+
+    Returns:
+        Model configuration dictionary.
+    """
+    return {
+        'url': url,
+        'num_classes': 0, 'input_size': (3, 224, 224), 'pool_size': None,
+        'crop_pct': 1.0, 'interpolation': 'bicubic', 'fixed_input_size': True,
+        'mean': (0.5, 0.5, 0.5), 'std': (0.5, 0.5, 0.5),
+        'first_conv': 'patch_embed.proj', 'classifier': 'head',
+        'license': 'custom', **kwargs
     }
 
 
@@ -984,35 +1321,154 @@ default_cfgs = generate_default_cfgs({
         input_size=(3, 256, 256), crop_pct=0.95,
         mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)
     ),
+
+    # Perception Encoder weights
+    'vit_pe_core_base_patch16_224.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Core-B16-224',
+        #hf_hub_filename='PE-Core-B16-224.pt',
+        input_size=(3, 224, 224),
+        num_classes=1024,  # output proj dim
+    ),
+    'vit_pe_core_large_patch14_336.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Core-L14-336',
+        #hf_hub_filename='PE-Core-L14-336.pt',
+        input_size=(3, 336, 336),
+        num_classes=1024,  # output proj dim
+    ),
+    'vit_pe_core_gigantic_patch14_448.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Core-G14-448',
+        #hf_hub_filename='PE-Core-G14-448.pt',
+        input_size=(3, 448, 448),
+        num_classes=1280,  # output proj dim
+    ),
+    'vit_pe_lang_large_patch14_448.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Lang-L14-448',
+        #hf_hub_filename='PE-Lang-L14-448.pt',
+        input_size=(3, 448, 448),
+        num_classes=0,
+    ),
+    'vit_pe_lang_gigantic_patch14_448.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Lang-G14-448',
+        #hf_hub_filename='PE-Lang-G14-448.pt',
+        input_size=(3, 448, 448),
+        num_classes=0,
+    ),
+    'vit_pe_spatial_gigantic_patch14_448.fb': _pe_cfg(
+        hf_hub_id='timm/',
+        #hf_hub_id='facebook/PE-Spatial-G14-448',
+        #hf_hub_filename='PE-Spatial-G14-448.pt',
+        input_size=(3, 448, 448),
+        num_classes=0,
+    ),
+
+    # RoPE-ViT models from Naver
+    'vit_small_patch16_rope_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_base_patch16_rope_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_large_patch16_rope_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_small_patch16_rope_mixed_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_base_patch16_rope_mixed_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_large_patch16_rope_mixed_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_small_patch16_rope_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_base_patch16_rope_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_large_patch16_rope_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_small_patch16_rope_mixed_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_base_patch16_rope_mixed_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
+    'vit_large_patch16_rope_mixed_ape_224.naver_in1k': _cfg(
+        hf_hub_id='timm/',
+        mean=IMAGENET_DEFAULT_MEAN,
+        std=IMAGENET_DEFAULT_STD,
+        license='apache-2.0',
+    ),
 })
 
 
 @register_model
-def eva_giant_patch14_224(pretrained=False, **kwargs) -> Eva:
-    """ EVA-g model https://arxiv.org/abs/2211.07636 """
+def eva_giant_patch14_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA-g model https://arxiv.org/abs/2211.07636"""
     model_args = dict(patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=6144 / 1408)
     model = _create_eva('eva_giant_patch14_224', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def eva_giant_patch14_336(pretrained=False, **kwargs) -> Eva:
-    """ EVA-g model https://arxiv.org/abs/2211.07636 """
+def eva_giant_patch14_336(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA-g model https://arxiv.org/abs/2211.07636"""
     model_args = dict(patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=6144 / 1408)
     model = _create_eva('eva_giant_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def eva_giant_patch14_560(pretrained=False, **kwargs) -> Eva:
-    """ EVA-g model https://arxiv.org/abs/2211.07636 """
+def eva_giant_patch14_560(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA-g model https://arxiv.org/abs/2211.07636"""
     model_args = dict(patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=6144 / 1408)
     model = _create_eva('eva_giant_patch14_560', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def eva02_tiny_patch14_224(pretrained=False, **kwargs) -> Eva:
+def eva02_tiny_patch14_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Tiny https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1029,7 +1485,8 @@ def eva02_tiny_patch14_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_small_patch14_224(pretrained=False, **kwargs) -> Eva:
+def eva02_small_patch14_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Small https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1046,7 +1503,8 @@ def eva02_small_patch14_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_base_patch14_224(pretrained=False, **kwargs) -> Eva:
+def eva02_base_patch14_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Base https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1065,7 +1523,8 @@ def eva02_base_patch14_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_large_patch14_224(pretrained=False, **kwargs) -> Eva:
+def eva02_large_patch14_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Large https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1084,7 +1543,8 @@ def eva02_large_patch14_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_tiny_patch14_336(pretrained=False, **kwargs) -> Eva:
+def eva02_tiny_patch14_336(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Tiny https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=336,
         patch_size=14,
@@ -1101,7 +1561,8 @@ def eva02_tiny_patch14_336(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_small_patch14_336(pretrained=False, **kwargs) -> Eva:
+def eva02_small_patch14_336(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Small https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=336,
         patch_size=14,
@@ -1118,7 +1579,8 @@ def eva02_small_patch14_336(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_base_patch14_448(pretrained=False, **kwargs) -> Eva:
+def eva02_base_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Base https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=448,
         patch_size=14,
@@ -1137,7 +1599,8 @@ def eva02_base_patch14_448(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_large_patch14_448(pretrained=False, **kwargs) -> Eva:
+def eva02_large_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA02 Large https://arxiv.org/abs/2303.11331"""
     model_args = dict(
         img_size=448,
         patch_size=14,
@@ -1156,8 +1619,8 @@ def eva02_large_patch14_448(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva_giant_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
-    """ EVA-g CLIP model (only difference from non-CLIP is the pooling)  """
+def eva_giant_patch14_clip_224(pretrained: bool = False, **kwargs) -> Eva:
+    """EVA-g CLIP model (only difference from non-CLIP is the pooling)"""
     model_args = dict(
         patch_size=14, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=6144 / 1408,
         global_pool=kwargs.pop('global_pool', 'token'))
@@ -1166,8 +1629,8 @@ def eva_giant_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_base_patch16_clip_224(pretrained=False, **kwargs) -> Eva:
-    """ A EVA-CLIP specific variant that adds additional attn scale layernorm to eva02_base """
+def eva02_base_patch16_clip_224(pretrained: bool = False, **kwargs) -> Eva:
+    """An EVA-CLIP specific variant that adds additional attn scale layer-norm to eva02_base"""
     model_args = dict(
         img_size=224,
         patch_size=16,
@@ -1188,8 +1651,8 @@ def eva02_base_patch16_clip_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_large_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
-    """ A EVA-CLIP specific variant that adds additional attn scale layernorm to eva02_large """
+def eva02_large_patch14_clip_224(pretrained: bool = False, **kwargs) -> Eva:
+    """An EVA-CLIP specific variant that adds additional attn scale layer-norm to eva02_large"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1210,8 +1673,8 @@ def eva02_large_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_large_patch14_clip_336(pretrained=False, **kwargs) -> Eva:
-    """ A EVA-CLIP specific variant that adds additional attn scale layernorm to eva02_large """
+def eva02_large_patch14_clip_336(pretrained: bool = False, **kwargs) -> Eva:
+    """An EVA-CLIP specific variant that adds additional attn scale layer-norm to eva02_large"""
     model_args = dict(
         img_size=336,
         patch_size=14,
@@ -1232,8 +1695,8 @@ def eva02_large_patch14_clip_336(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def eva02_enormous_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
-    """ A EVA-CLIP specific variant that uses residual post-norm in blocks """
+def eva02_enormous_patch14_clip_224(pretrained: bool = False, **kwargs) -> Eva:
+    """An EVA-CLIP specific variant that uses residual post-norm in blocks"""
     model_args = dict(
         img_size=224,
         patch_size=14,
@@ -1249,7 +1712,8 @@ def eva02_enormous_patch14_clip_224(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def vit_medium_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
+def vit_medium_patch16_rope_reg1_gap_256(pretrained: bool = False, **kwargs) -> Eva:
+    """timm SBB ViT with ROPE"""
     model_args = dict(
         img_size=256,
         patch_size=16,
@@ -1270,7 +1734,8 @@ def vit_medium_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def vit_mediumd_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
+def vit_mediumd_patch16_rope_reg1_gap_256(pretrained: bool = False, **kwargs) -> Eva:
+    """timm SBB ViT with ROPE"""
     model_args = dict(
         img_size=256,
         patch_size=16,
@@ -1291,7 +1756,8 @@ def vit_mediumd_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def vit_betwixt_patch16_rope_reg4_gap_256(pretrained=False, **kwargs) -> Eva:
+def vit_betwixt_patch16_rope_reg4_gap_256(pretrained: bool = False, **kwargs) -> Eva:
+    """timm SBB ViT with ROPE"""
     model_args = dict(
         img_size=256,
         patch_size=16,
@@ -1312,7 +1778,8 @@ def vit_betwixt_patch16_rope_reg4_gap_256(pretrained=False, **kwargs) -> Eva:
 
 
 @register_model
-def vit_base_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
+def vit_base_patch16_rope_reg1_gap_256(pretrained: bool = False, **kwargs) -> Eva:
+    """timm SBB ViT with ROPE"""
     model_args = dict(
         img_size=256,
         patch_size=16,
@@ -1330,3 +1797,443 @@ def vit_base_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
     )
     model = _create_eva('vit_base_patch16_rope_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
+
+
+@register_model
+def vit_pe_core_base_patch16_224(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        global_pool='map',
+        attn_type='rope',
+        use_pre_transformer_norm=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(14, 14),
+        rope_grid_offset=1.,
+        rope_grid_indexing='xy',
+        attn_pool_num_heads=8,
+        attn_pool_mlp_ratio=4.,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True
+    )
+    return _create_eva('vit_pe_core_base_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def vit_pe_core_large_patch14_336(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=14,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4.0,
+        global_pool='map',
+        attn_type='rope',
+        use_pre_transformer_norm=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(24, 24),
+        rope_grid_offset=1.,
+        rope_grid_indexing='xy',
+        attn_pool_num_heads=8,
+        attn_pool_mlp_ratio=4.,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True,
+    )
+    return _create_eva('vit_pe_core_large_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def vit_pe_core_gigantic_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=14,
+        embed_dim=1536,
+        depth=50,
+        num_heads=16,
+        mlp_ratio=8960 / 1536,
+        global_pool='map',
+        attn_type='rope',
+        class_token=False,
+        use_pre_transformer_norm=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(32, 32),
+        rope_grid_indexing='xy',
+        attn_pool_num_heads=8,
+        attn_pool_mlp_ratio=4.,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True,
+    )
+    return _create_eva('vit_pe_core_gigantic_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def vit_pe_lang_large_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=14,
+        embed_dim=1024,
+        depth=23,
+        num_heads=16,
+        mlp_ratio=4.0,
+        attn_type='rope',
+        class_token=True,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(32, 32),
+        rope_grid_offset=1.,
+        rope_grid_indexing='xy',
+        use_pre_transformer_norm=True,
+        use_post_transformer_norm=False,
+        use_fc_norm=False,  # explicitly disable
+        init_values=0.1,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True,
+    )
+    return _create_eva('vit_pe_lang_large_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def vit_pe_lang_gigantic_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=14,
+        embed_dim=1536,
+        depth=47,
+        num_heads=16,
+        mlp_ratio=8960 / 1536,
+        attn_type='rope',
+        class_token=False,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(32, 32),
+        rope_grid_indexing='xy',
+        use_pre_transformer_norm=True,
+        use_post_transformer_norm=False,
+        use_fc_norm=False,  # explicitly disable
+        init_values=0.1,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True,
+    )
+    return _create_eva('vit_pe_lang_gigantic_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+@register_model
+def vit_pe_spatial_gigantic_patch14_448(pretrained: bool = False, **kwargs) -> Eva:
+    """Perception Encoder (PE) ViT from Meta (https://arxiv.org/abs/2504.13181)"""
+    model_args = dict(
+        patch_size=14,
+        embed_dim=1536,
+        depth=50,
+        num_heads=16,
+        mlp_ratio=8960 / 1536,
+        attn_type='rope',
+        class_token=False,
+        use_rot_pos_emb=True,
+        ref_feat_shape=(32, 32),
+        rope_grid_indexing='xy',
+        use_pre_transformer_norm=True,
+        use_post_transformer_norm=False,
+        use_fc_norm=False,  # explicitly disable
+        init_values=0.1,
+        norm_layer=partial(LayerNorm, eps=1e-5),
+        #dynamic_img_size=True,
+    )
+    return _create_eva('vit_pe_spatial_gigantic_patch14_448', pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+# RoPE-ViT models from https://github.com/naver-ai/rope-vit
+@register_model
+def vit_small_patch16_rope_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial ViT-S/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+    model = _create_eva('vit_small_patch16_rope_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_base_patch16_rope_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial ViT-B/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        attn_type='rope',
+        use_fc_norm=False,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+    model = _create_eva('vit_base_patch16_rope_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_large_patch16_rope_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial ViT-L/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+    model = _create_eva('vit_large_patch16_rope_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_small_patch16_rope_mixed_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed ViT-S/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+    model = _create_eva('vit_small_patch16_rope_mixed_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_base_patch16_rope_mixed_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed ViT-B/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        attn_type='rope',
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+    model = _create_eva('vit_base_patch16_rope_mixed_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_large_patch16_rope_mixed_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed ViT-L/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        use_abs_pos_emb=False,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+    model = _create_eva('vit_large_patch16_rope_mixed_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+# APE variants (with absolute position embeddings)
+@register_model
+def vit_small_patch16_rope_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial + APE ViT-S/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+    model = _create_eva('vit_small_patch16_rope_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_base_patch16_rope_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial + APE ViT-B/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+
+    model = _create_eva('vit_base_patch16_rope_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_large_patch16_rope_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Axial + APE ViT-L/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=100.0,
+    )
+    
+    model = _create_eva('vit_large_patch16_rope_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_small_patch16_rope_mixed_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed + APE ViT-S/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+
+    model = _create_eva('vit_small_patch16_rope_mixed_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_base_patch16_rope_mixed_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed + APE ViT-B/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+    model = _create_eva('vit_base_patch16_rope_mixed_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_large_patch16_rope_mixed_ape_224(pretrained: bool = False, **kwargs) -> Eva:
+    """RoPE-Mixed + APE ViT-L/16 from https://github.com/naver-ai/rope-vit"""
+    model_args = dict(
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        attn_type='rope',
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=True,
+        global_pool='token',
+        no_embed_class=True,
+        use_abs_pos_emb=True,
+        use_rot_pos_emb=True,
+        rope_grid_indexing='xy',
+        rope_temperature=10.0,
+        rope_mixed_mode=True,
+    )
+    model = _create_eva('vit_large_patch16_rope_mixed_ape_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+

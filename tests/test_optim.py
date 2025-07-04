@@ -290,7 +290,7 @@ def _build_params_dict_single(weight, bias, **kwargs):
     return [dict(params=bias, **kwargs)]
 
 
-@pytest.mark.parametrize('optimizer', list_optimizers(exclude_filters=('fused*', 'bnb*')))
+@pytest.mark.parametrize('optimizer', list_optimizers(exclude_filters=('fused*', 'bnb*', 'kron*')))
 def test_optim_factory(optimizer):
     assert issubclass(get_optimizer_class(optimizer, bind_defaults=False), torch.optim.Optimizer)
 
@@ -298,7 +298,7 @@ def test_optim_factory(optimizer):
     assert isinstance(opt_info, OptimInfo)
 
     lr = (1e-2,) * 4
-    if optimizer in ('mars', 'nadam', 'claprop', 'crmsproptf', 'cadafactorbv', 'csgdw', 'clamb'):
+    if optimizer in ('mars', 'nadam', 'claprop', 'crmsproptf', 'cadafactorbv', 'csgdw', 'csgdc', 'clamb'):
         lr = (1e-3,) * 4
     elif optimizer in ('cmars',):
         lr = (1e-4,) * 4
@@ -378,12 +378,20 @@ def test_sgd(optimizer):
     _test_model(optimizer, dict(lr=1e-3))
 
 
-@pytest.mark.parametrize('optimizer',  ['adamw', 'adam', 'nadam', 'adamax', 'nadamw'])
+@pytest.mark.parametrize('optimizer',  ['adamw', 'adam', 'nadam', 'adamax', 'nadamw', 'adamwlegacy', 'adamc'])
 def test_adam(optimizer):
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=5e-2)
     )
     _test_model(optimizer, dict(lr=5e-2))
+
+
+@pytest.mark.parametrize('optimizer',  ['kron'])
+def test_kron(optimizer):
+    _test_rosenbrock(
+        lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
+    )
+    _test_model(optimizer, dict(lr=1e-3))
 
 
 @pytest.mark.parametrize('optimizer',  ['adopt', 'adoptw'])

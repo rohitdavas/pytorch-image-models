@@ -33,6 +33,7 @@ def fast_collate(batch):
     if isinstance(batch[0][0], tuple):
         # This branch 'deinterleaves' and flattens tuples of input tensors into one tensor ordered by position
         # such that all tuple of position n will end up in a torch.split(tensor, batch_size) in nth position
+        is_np = isinstance(batch[0][0], np.ndarray)
         inner_tuple_size = len(batch[0][0])
         flattened_batch_size = batch_size * inner_tuple_size
         targets = torch.zeros(flattened_batch_size, dtype=torch.int64)
@@ -41,7 +42,10 @@ def fast_collate(batch):
             assert len(batch[i][0]) == inner_tuple_size  # all input tensor tuples must be same length
             for j in range(inner_tuple_size):
                 targets[i + j * batch_size] = batch[i][1]
-                tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
+                if is_np:
+                    tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
+                else:
+                    tensor[i + j * batch_size] += batch[i][0][j]
         return tensor, targets
     elif isinstance(batch[0][0], np.ndarray):
         targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
@@ -119,10 +123,10 @@ class PrefetchLoader:
     def __iter__(self):
         first = True
         if self.is_cuda:
-            stream = torch.cuda.Stream()
+            stream = torch.cuda.Stream(device=self.device)
             stream_context = partial(torch.cuda.stream, stream=stream)
         elif self.is_npu:
-            stream = torch.npu.Stream()
+            stream = torch.npu.Stream(device=self.device)
             stream_context = partial(torch.npu.stream, stream=stream)
         else:
             stream = None
@@ -144,9 +148,9 @@ class PrefetchLoader:
 
             if stream is not None:
                 if self.is_cuda:
-                    torch.cuda.current_stream().wait_stream(stream)
+                    torch.cuda.current_stream(device=self.device).wait_stream(stream)
                 elif self.is_npu:
-                    torch.npu.current_stream().wait_stream(stream)
+                    torch.npu.current_stream(device=self.device).wait_stream(stream)
 
             input = next_input
             target = next_target

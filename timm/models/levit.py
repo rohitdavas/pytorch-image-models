@@ -34,7 +34,7 @@ from timm.data import IMAGENET_DEFAULT_STD, IMAGENET_DEFAULT_MEAN
 from timm.layers import to_ntuple, to_2tuple, get_act_layer, DropPath, trunc_normal_, ndgrid
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
-from ._manipulate import checkpoint_seq
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import generate_default_cfgs, register_model
 
 __all__ = ['Levit']
@@ -671,7 +671,10 @@ class Levit(nn.Module):
         else:
             stages = self.stages[:max_index + 1]
         for feat_idx, stage in enumerate(stages):
-            x = stage(x)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(stage, x)
+            else:
+                x = stage(x)
             if feat_idx in take_indices:
                 if self.use_conv:
                     intermediates.append(x)
@@ -763,17 +766,18 @@ def checkpoint_filter_fn(state_dict, model):
     # filter out attn biases, should not have been persistent
     state_dict = {k: v for k, v in state_dict.items() if 'attention_bias_idxs' not in k}
 
-    D = model.state_dict()
-    out_dict = {}
-    for ka, kb, va, vb in zip(D.keys(), state_dict.keys(), D.values(), state_dict.values()):
-        if va.ndim == 4 and vb.ndim == 2:
-            vb = vb[:, :, None, None]
-        if va.shape != vb.shape:
-            # head or first-conv shapes may change for fine-tune
-            assert 'head' in ka or 'stem.conv1.linear' in ka
-        out_dict[ka] = vb
+    # NOTE: old weight conversion code, disabled
+    # D = model.state_dict()
+    # out_dict = {}
+    # for ka, kb, va, vb in zip(D.keys(), state_dict.keys(), D.values(), state_dict.values()):
+    #     if va.ndim == 4 and vb.ndim == 2:
+    #         vb = vb[:, :, None, None]
+    #     if va.shape != vb.shape:
+    #         # head or first-conv shapes may change for fine-tune
+    #         assert 'head' in ka or 'stem.conv1.linear' in ka
+    #     out_dict[ka] = vb
 
-    return out_dict
+    return state_dict
 
 
 model_cfgs = dict(

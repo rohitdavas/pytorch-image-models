@@ -81,8 +81,8 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int,
-                    metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
+parser.add_argument('--input-size', default=None, nargs=3, type=int, metavar='N',
+                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
 parser.add_argument('--crop-pct', default=None, type=float,
@@ -157,6 +157,12 @@ parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
                     help='Valid label indices txt file for validation of partial label space')
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
+
+# NaFlex loader arguments
+parser.add_argument('--naflex-loader', action='store_true', default=False,
+                   help='Use NaFlex loader (Requires NaFlex compatible model)')
+parser.add_argument('--naflex-max-seq-len', type=int, default=576,
+                   help='Fixed maximum sequence length for NaFlex loader (validation)')
 
 
 def validate(args):
@@ -293,23 +299,43 @@ def validate(args):
         real_labels = None
 
     crop_pct = 1.0 if test_time_pool else data_config['crop_pct']
-    loader = create_loader(
-        dataset,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        crop_pct=crop_pct,
-        crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
-        pin_memory=args.pin_mem,
-        device=device,
-        img_dtype=model_dtype or torch.float32,
-        tf_preprocessing=args.tf_preprocessing,
-    )
+    if args.naflex_loader:
+        from timm.data  import create_naflex_loader
+        loader = create_naflex_loader(
+            dataset,
+            batch_size=args.batch_size,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            crop_pct=crop_pct,
+            crop_mode=data_config['crop_mode'],
+            crop_border_pixels=args.crop_border_pixels,
+            pin_memory=args.pin_mem,
+            device=device,
+            img_dtype=model_dtype or torch.float32,
+            patch_size=16,  # Could be derived from model config
+            max_seq_len=args.naflex_max_seq_len,
+        )
+    else:
+        loader = create_loader(
+            dataset,
+            input_size=data_config['input_size'],
+            batch_size=args.batch_size,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            crop_pct=crop_pct,
+            crop_mode=data_config['crop_mode'],
+            crop_border_pixels=args.crop_border_pixels,
+            pin_memory=args.pin_mem,
+            device=device,
+            img_dtype=model_dtype or torch.float32,
+            tf_preprocessing=args.tf_preprocessing,
+        )
 
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -317,13 +343,14 @@ def validate(args):
     top5 = AverageMeter()
 
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device=device, dtype=model_dtype)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
+        if not args.naflex_loader:
+            input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device=device, dtype=model_dtype)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            with amp_autocast():
+                model(input)
 
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
@@ -345,10 +372,11 @@ def validate(args):
                 real_labels.add_result(output)
 
             # measure accuracy and record loss
+            batch_size = output.shape[0]
             acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1.item(), input.size(0))
-            top5.update(acc5.item(), input.size(0))
+            losses.update(loss.item(), batch_size)
+            top1.update(acc1.item(), batch_size)
+            top5.update(acc5.item(), batch_size)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -364,7 +392,7 @@ def validate(args):
                         batch_idx,
                         len(loader),
                         batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
+                        rate_avg=batch_size / batch_time.avg,
                         loss=losses,
                         top1=top1,
                         top5=top5
@@ -412,6 +440,7 @@ def _try_run(args, initial_batch_size):
                 break
         batch_size = decay_batch_step(batch_size)
         _logger.warning(f'Reducing batch size to {batch_size} for retry.')
+    results['model'] = args.model
     results['error'] = error_str
     _logger.error(f'{args.model} failed to validate ({error_str}).')
     return results

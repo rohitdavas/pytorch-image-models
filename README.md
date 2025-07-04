@@ -12,6 +12,87 @@
 
 ## What's New
 
+## June 26, 2025
+* MobileNetV5 backbone (w/ encoder only variant) for [Gemma 3n](https://ai.google.dev/gemma/docs/gemma-3n#parameters) image encoder
+* Version 1.0.16 released
+
+## June 23, 2025
+* Add F.grid_sample based 2D and factorized pos embed resize to NaFlexViT. Faster when lots of different sizes (based on example by https://github.com/stas-sl).
+* Further speed up patch embed resample by replacing vmap with matmul (based on snippet by https://github.com/stas-sl).
+* Add 3 initial native aspect NaFlexViT checkpoints created while testing, ImageNet-1k and 3 different pos embed configs w/ same hparams.
+
+ | Model | Top-1 Acc | Top-5 Acc | Params (M) | Eval Seq Len |
+ |:---|:---:|:---:|:---:|:---:|
+ | [naflexvit_base_patch16_par_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_par_gap.e300_s576_in1k) | 83.67 | 96.45 | 86.63 | 576 |
+ | [naflexvit_base_patch16_parfac_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_parfac_gap.e300_s576_in1k) | 83.63 | 96.41 | 86.46 | 576 |
+ | [naflexvit_base_patch16_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_gap.e300_s576_in1k) | 83.50 | 96.46 | 86.63 | 576 |
+* Support gradient checkpointing for `forward_intermediates` and fix some checkpointing bugs. Thanks https://github.com/brianhou0208
+* Add 'corrected weight decay' (https://arxiv.org/abs/2506.02285) as option to AdamW (legacy), Adopt, Kron, Adafactor (BV), Lamb, LaProp, Lion, NadamW, RmsPropTF, SGDW optimizers
+* Switch PE (perception encoder) ViT models to use native timm weights instead of remapping on the fly
+* Fix cuda stream bug in prefetch loader
+  
+## June 5, 2025
+* Initial NaFlexVit model code. NaFlexVit is a Vision Transformer with:
+  1. Encapsulated embedding and position encoding in a single module
+  2. Support for nn.Linear patch embedding on pre-patchified (dictionary) inputs
+  3. Support for NaFlex variable aspect, variable resolution (SigLip-2: https://arxiv.org/abs/2502.14786)
+  4. Support for FlexiViT variable patch size (https://arxiv.org/abs/2212.08013)
+  5. Support for NaViT fractional/factorized position embedding (https://arxiv.org/abs/2307.06304)
+* Existing vit models in `vision_transformer.py` can be loaded into the NaFlexVit model by adding the `use_naflex=True` flag to `create_model`
+  * Some native weights coming soon
+* A full NaFlex data pipeline is available that allows training / fine-tuning / evaluating with variable aspect / size images
+  * To enable in `train.py` and `validate.py` add the `--naflex-loader` arg, must be used with a NaFlexVit
+* To evaluate an existing (classic) ViT loaded in NaFlexVit model w/ NaFlex data pipe:
+  * `python validate.py /imagenet --amp -j 8 --model vit_base_patch16_224 --model-kwargs use_naflex=True --naflex-loader --naflex-max-seq-len 256` 
+* The training has some extra args features worth noting
+  * The `--naflex-train-seq-lens'` argument specifies which sequence lengths to randomly pick from per batch during training
+  * The `--naflex-max-seq-len` argument sets the target sequence length for validation
+  * Adding `--model-kwargs enable_patch_interpolator=True --naflex-patch-sizes 12 16 24` will enable random patch size selection per-batch w/ interpolation
+  * The `--naflex-loss-scale` arg changes loss scaling mode per batch relative to the batch size, `timm` NaFlex loading changes the batch size for each seq len
+
+## May 28, 2025
+* Add a number of small/fast models thanks to https://github.com/brianhou0208
+  * SwiftFormer - [(ICCV2023) SwiftFormer: Efficient Additive Attention for Transformer-based Real-time Mobile Vision Applications](https://github.com/Amshaker/SwiftFormer) 
+  * FasterNet - [(CVPR2023) Run, Don’t Walk: Chasing Higher FLOPS for Faster Neural Networks](https://github.com/JierunChen/FasterNet)
+  * SHViT - [(CVPR2024) SHViT: Single-Head Vision Transformer with Memory Efficient](https://github.com/ysj9909/SHViT)
+  * StarNet - [(CVPR2024) Rewrite the Stars](https://github.com/ma-xu/Rewrite-the-Stars)
+  * GhostNet-V3 [GhostNetV3: Exploring the Training Strategies for Compact Models](https://github.com/huawei-noah/Efficient-AI-Backbones/tree/master/ghostnetv3_pytorch)
+* Update EVA ViT (closest match) to support Perception Encoder models (https://arxiv.org/abs/2504.13181) from Meta, loading Hub weights but I still need to push dedicated `timm` weights
+  * Add some flexibility to ROPE impl
+* Big increase in number of models supporting `forward_intermediates()` and some additional fixes thanks to https://github.com/brianhou0208
+  * DaViT, EdgeNeXt, EfficientFormerV2, EfficientViT(MIT), EfficientViT(MSRA), FocalNet, GCViT, HGNet /V2, InceptionNeXt, Inception-V4, MambaOut, MetaFormer, NesT, Next-ViT, PiT, PVT V2, RepGhostNet, RepViT, ResNetV2, ReXNet, TinyViT, TResNet, VoV
+* TNT model updated w/ new weights `forward_intermediates()` thanks to https://github.com/brianhou0208
+* Add `local-dir:` pretrained schema, can use `local-dir:/path/to/model/folder` for model name to source model / pretrained cfg & weights Hugging Face Hub models (config.json + weights file) from a local folder.
+* Fixes, improvements for onnx export
+    
+## Feb 21, 2025
+* SigLIP 2 ViT image encoders added (https://huggingface.co/collections/timm/siglip-2-67b8e72ba08b09dd97aecaf9)
+  * Variable resolution / aspect NaFlex versions are a WIP
+* Add 'SO150M2' ViT weights trained with SBB recipes, great results, better for ImageNet than previous attempt w/ less training.
+  * `vit_so150m2_patch16_reg1_gap_448.sbb_e200_in12k_ft_in1k` - 88.1% top-1
+  * `vit_so150m2_patch16_reg1_gap_384.sbb_e200_in12k_ft_in1k` - 87.9% top-1
+  * `vit_so150m2_patch16_reg1_gap_256.sbb_e200_in12k_ft_in1k` - 87.3% top-1
+  * `vit_so150m2_patch16_reg4_gap_256.sbb_e200_in12k`
+* Updated InternViT-300M '2.5' weights
+* Release 1.0.15
+
+## Feb 1, 2025
+* FYI PyTorch 2.6 & Python 3.13 are tested and working w/ current main and released version of `timm`
+
+## Jan 27, 2025
+* Add Kron Optimizer (PSGD w/ Kronecker-factored preconditioner) 
+  * Code from https://github.com/evanatyourservice/kron_torch
+  * See also https://sites.google.com/site/lixilinx/home/psgd
+
+## Jan 19, 2025
+* Fix loading of LeViT safetensor weights, remove conversion code which should have been deactivated
+* Add 'SO150M' ViT weights trained with SBB recipes, decent results, but not optimal shape for ImageNet-12k/1k pretrain/ft
+  * `vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k_ft_in1k` - 86.7% top-1
+  * `vit_so150m_patch16_reg4_gap_384.sbb_e250_in12k_ft_in1k` - 87.4% top-1
+  * `vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k`
+* Misc typing, typo, etc. cleanup
+* 1.0.14 release to get above LeViT fix out
+
 ## Jan 9, 2025
 * Add support to train and validate in pure `bfloat16` or `float16`
 * `wandb` project name arg added by https://github.com/caojiaolong, use arg.experiment for name
@@ -115,7 +196,6 @@ Add a set of new very well trained ResNet & ResNet-V2 18/34 (basic block) weight
 * Add MobileNetV3-Large variants trained with MNV4 Small recipe
   * [mobilenetv3_large_150d.ra4_e3600_r256_in1k](http://hf.co/timm/mobilenetv3_large_150d.ra4_e3600_r256_in1k) - 81.81 @ 320, 80.94 @ 256
   * [mobilenetv3_large_100.ra4_e3600_r224_in1k](http://hf.co/timm/mobilenetv3_large_100.ra4_e3600_r224_in1k) - 77.16 @ 256, 76.31 @ 224
-
 
 ### Aug 21, 2024
 * Updated SBB ViT models trained on ImageNet-12k and fine-tuned on ImageNet-1k, challenging quite a number of much larger, slower models
@@ -238,7 +318,7 @@ Add a set of new very well trained ResNet & ResNet-V2 18/34 (basic block) weight
 ### May 14, 2024
 * Support loading PaliGemma jax weights into SigLIP ViT models with average pooling.
 * Add Hiera models from Meta (https://github.com/facebookresearch/hiera).
-* Add `normalize=` flag for transorms, return non-normalized torch.Tensor with original dytpe (for `chug`)
+* Add `normalize=` flag for transforms, return non-normalized torch.Tensor with original dytpe (for `chug`)
 * Version 1.0.3 release
 
 ### May 11, 2024
@@ -319,53 +399,6 @@ torch.Size([2, 768, 32, 32])
 * Min supported Python version increased to 3.8
 * Release 0.9.16
 
-### Jan 8, 2024
-Datasets & transform refactoring
-* HuggingFace streaming (iterable) dataset support (`--dataset hfids:org/dataset`)
-* Webdataset wrapper tweaks for improved split info fetching, can auto fetch splits from supported HF hub webdataset
-* Tested HF `datasets` and webdataset wrapper streaming from HF hub with recent `timm` ImageNet uploads to https://huggingface.co/timm
-* Make input & target column/field keys consistent across datasets and pass via args
-* Full monochrome support when using e:g: `--input-size 1 224 224` or `--in-chans 1`, sets PIL image conversion appropriately in dataset
-* Improved several alternate crop & resize transforms (ResizeKeepRatio, RandomCropOrPad, etc) for use in PixParse document AI project
-* Add SimCLR style color jitter prob along with grayscale and gaussian blur options to augmentations and args
-* Allow train without validation set (`--val-split ''`) in train script
-* Add `--bce-sum` (sum over class dim) and `--bce-pos-weight` (positive weighting) args for training as they're common BCE loss tweaks I was often hard coding 
-
-### Nov 23, 2023
-* Added EfficientViT-Large models, thanks [SeeFun](https://github.com/seefun)
-* Fix Python 3.7 compat, will be dropping support for it soon
-* Other misc fixes
-* Release 0.9.12
-
-### Nov 20, 2023
-* Added significant flexibility for Hugging Face Hub based timm models via `model_args` config entry. `model_args` will be passed as kwargs through to models on creation. 
-  * See example at https://huggingface.co/gaunernst/vit_base_patch16_1024_128.audiomae_as2m_ft_as20k/blob/main/config.json
-  * Usage: https://github.com/huggingface/pytorch-image-models/discussions/2035
-* Updated imagenet eval and test set csv files with latest models
-* `vision_transformer.py` typing and doc cleanup by [Laureηt](https://github.com/Laurent2916)
-* 0.9.11 release
-
-### Nov 3, 2023
-* [DFN (Data Filtering Networks)](https://huggingface.co/papers/2309.17425) and [MetaCLIP](https://huggingface.co/papers/2309.16671) ViT weights added
-* DINOv2 'register' ViT model weights added (https://huggingface.co/papers/2309.16588, https://huggingface.co/papers/2304.07193)
-* Add `quickgelu` ViT variants for OpenAI, DFN, MetaCLIP weights that use it (less efficient)
-* Improved typing added to ResNet, MobileNet-v3 thanks to [Aryan](https://github.com/a-r-r-o-w)
-* ImageNet-12k fine-tuned (from LAION-2B CLIP) `convnext_xxlarge`
-* 0.9.9 release
-
-### Oct 20, 2023
-* [SigLIP](https://huggingface.co/papers/2303.15343) image tower weights supported in `vision_transformer.py`.
-  * Great potential for fine-tune and downstream feature use.
-* Experimental 'register' support in vit models as per [Vision Transformers Need Registers](https://huggingface.co/papers/2309.16588)
-* Updated RepViT with new weight release. Thanks [wangao](https://github.com/jameslahm)
-* Add patch resizing support (on pretrained weight load) to Swin models
-* 0.9.8 release pending
-
-### Sep 1, 2023
-* TinyViT added by [SeeFun](https://github.com/seefun)
-* Fix EfficientViT (MIT) to use torch.autocast so it works back to PT 1.10
-* 0.9.7 release
-
 ## Introduction
 
 Py**T**orch **Im**age **M**odels (`timm`) is a collection of image models, layers, utilities, optimizers, schedulers, data-loaders / augmentations, and reference training / validation scripts that aim to pull together a wide variety of SOTA models with ability to reproduce ImageNet training results.
@@ -380,6 +413,8 @@ All model architecture families include variants with pretrained weights. There 
 
 * Aggregating Nested Transformers - https://arxiv.org/abs/2105.12723
 * BEiT - https://arxiv.org/abs/2106.08254
+* BEiT-V2 - https://arxiv.org/abs/2208.06366
+* BEiT3 - https://arxiv.org/abs/2208.10442
 * Big Transfer ResNetV2 (BiT) - https://arxiv.org/abs/1912.11370
 * Bottleneck Transformers - https://arxiv.org/abs/2101.11605
 * CaiT (Class-Attention in Image Transformers) - https://arxiv.org/abs/2103.17239
@@ -396,6 +431,7 @@ All model architecture families include variants with pretrained weights. There 
 * DPN (Dual-Path Network) - https://arxiv.org/abs/1707.01629
 * EdgeNeXt - https://arxiv.org/abs/2206.10589
 * EfficientFormer - https://arxiv.org/abs/2206.01191
+* EfficientFormer-V2 - https://arxiv.org/abs/2212.08059
 * EfficientNet (MBConvNet Family)
     * EfficientNet NoisyStudent (B0-B7, L2) - https://arxiv.org/abs/1911.04252
     * EfficientNet AdvProp (B0-B8) - https://arxiv.org/abs/1911.09665
@@ -412,12 +448,14 @@ All model architecture families include variants with pretrained weights. There 
 * EfficientViT (MSRA) - https://arxiv.org/abs/2305.07027
 * EVA - https://arxiv.org/abs/2211.07636
 * EVA-02 - https://arxiv.org/abs/2303.11331
+* FasterNet - https://arxiv.org/abs/2303.03667
 * FastViT - https://arxiv.org/abs/2303.14189
 * FlexiViT - https://arxiv.org/abs/2212.08013
 * FocalNet (Focal Modulation Networks) - https://arxiv.org/abs/2203.11926
 * GCViT (Global Context Vision Transformer) - https://arxiv.org/abs/2206.09959
 * GhostNet - https://arxiv.org/abs/1911.11907
 * GhostNet-V2 - https://arxiv.org/abs/2211.12905
+* GhostNet-V3 - https://arxiv.org/abs/2404.11202
 * gMLP - https://arxiv.org/abs/2105.08050
 * GPU-Efficient Networks - https://arxiv.org/abs/2006.14090
 * Halo Nets - https://arxiv.org/abs/2103.12731
@@ -470,15 +508,23 @@ All model architecture families include variants with pretrained weights. There 
 * Res2Net - https://arxiv.org/abs/1904.01169
 * ResNeSt - https://arxiv.org/abs/2004.08955
 * ReXNet - https://arxiv.org/abs/2007.00992
+* ROPE-ViT - https://arxiv.org/abs/2403.13298
 * SelecSLS - https://arxiv.org/abs/1907.00837
 * Selective Kernel Networks - https://arxiv.org/abs/1903.06586
 * Sequencer2D - https://arxiv.org/abs/2205.01972
+* SHViT - https://arxiv.org/abs/2401.16456
+* SigLIP (image encoder) - https://arxiv.org/abs/2303.15343
+* SigLIP 2 (image encoder) - https://arxiv.org/abs/2502.14786
+* StarNet - https://arxiv.org/abs/2403.19967
+* SwiftFormer - https://arxiv.org/pdf/2303.15446
 * Swin S3 (AutoFormerV2) - https://arxiv.org/abs/2111.14725
 * Swin Transformer - https://arxiv.org/abs/2103.14030
 * Swin Transformer V2 - https://arxiv.org/abs/2111.09883
+* TinyViT - https://arxiv.org/abs/2207.10666
 * Transformer-iN-Transformer (TNT) - https://arxiv.org/abs/2103.00112
 * TResNet - https://arxiv.org/abs/2003.13630
 * Twins (Spatial Attention in Vision Transformers) - https://arxiv.org/pdf/2104.13840.pdf
+* VGG - https://arxiv.org/abs/1409.1556
 * Visformer - https://arxiv.org/abs/2104.12533
 * Vision Transformer - https://arxiv.org/abs/2010.11929
 * ViTamin - https://arxiv.org/abs/2404.02132
@@ -500,6 +546,7 @@ Included optimizers available via `timm.optim.create_optimizer_v2` factory metho
 * `adamp` and `sgdp` by [Naver ClovAI](https://github.com/clovaai) - https://arxiv.org/abs/2006.08217
 * `adan` an implementation of Adan adapted from https://github.com/sail-sg/Adan - https://arxiv.org/abs/2208.06677
 * `adopt` ADOPT adapted from https://github.com/iShohei220/adopt - https://arxiv.org/abs/2411.02853
+* `kron` PSGD w/ Kronecker-factored preconditioner from https://github.com/evanatyourservice/kron_torch - https://sites.google.com/site/lixilinx/home/psgd
 * `lamb` an implementation of Lamb and LambC (w/ trust-clipping) cleaned up and modified to support use with XLA - https://arxiv.org/abs/1904.00962
 * `laprop` optimizer from https://github.com/Z-T-WANG/LaProp-Optimizer - https://arxiv.org/abs/2002.04839
 * `lars` an implementation of LARS and LARC (w/ trust-clipping) - https://arxiv.org/abs/1708.03888
@@ -517,7 +564,8 @@ Included optimizers available via `timm.optim.create_optimizer_v2` factory metho
 * `bnb<name>` optimizers by name with [BitsAndBytes](https://github.com/TimDettmers/bitsandbytes) installed
 * `cadamw`, `clion`, and more 'Cautious' optimizers from https://github.com/kyleliang919/C-Optim - https://arxiv.org/abs/2411.16085
 * `adam`, `adamw`, `rmsprop`, `adadelta`, `adagrad`, and `sgd` pass through to `torch.optim` implementations
-
+* `c` suffix (eg `adamc`, `nadamc` to implement 'corrected weight decay' in https://arxiv.org/abs/2506.02285)
+  
 ### Augmentations
 * Random Erasing from [Zhun Zhong](https://github.com/zhunzhong07/Random-Erasing/blob/master/transforms.py) - https://arxiv.org/abs/1708.04896)
 * Mixup - https://arxiv.org/abs/1710.09412
@@ -583,7 +631,7 @@ Model validation results can be found in the [results tables](results/README.md)
 
 The official documentation can be found at https://huggingface.co/docs/hub/timm. Documentation contributions are welcome.
 
-[Getting Started with PyTorch Image Models (timm): A Practitioner’s Guide](https://towardsdatascience.com/getting-started-with-pytorch-image-models-timm-a-practitioners-guide-4e77b4bf9055) by [Chris Hughes](https://github.com/Chris-hughes10) is an extensive blog post covering many aspects of `timm` in detail.
+[Getting Started with PyTorch Image Models (timm): A Practitioner’s Guide](https://towardsdatascience.com/getting-started-with-pytorch-image-models-timm-a-practitioners-guide-4e77b4bf9055-2/) by [Chris Hughes](https://github.com/Chris-hughes10) is an extensive blog post covering many aspects of `timm` in detail.
 
 [timmdocs](http://timm.fast.ai/) is an alternate set of documentation for `timm`. A big thanks to [Aman Arora](https://github.com/amaarora) for his efforts creating timmdocs.
 
@@ -615,6 +663,7 @@ One of the greatest assets of PyTorch is the community and their contributions. 
 
 ### Training / Frameworks
 * fastai - https://github.com/fastai/fastai
+* lightly_train - https://github.com/lightly-ai/lightly-train
 
 ## Licenses
 

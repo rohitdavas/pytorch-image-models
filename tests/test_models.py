@@ -53,13 +53,16 @@ FEAT_INTER_FILTERS = [
     'vision_transformer', 'vision_transformer_sam', 'vision_transformer_hybrid', 'vision_transformer_relpos',
     'beit', 'mvitv2', 'eva', 'cait', 'xcit', 'volo', 'twins', 'deit', 'swin_transformer', 'swin_transformer_v2',
     'swin_transformer_v2_cr', 'maxxvit', 'efficientnet', 'mobilenetv3', 'levit', 'efficientformer', 'resnet',
-    'regnet', 'byobnet', 'byoanet', 'mlp_mixer', 'hiera', 'fastvit', 'hieradet_sam2', 'aimv2*'
+    'regnet', 'byobnet', 'byoanet', 'mlp_mixer', 'hiera', 'fastvit', 'hieradet_sam2', 'aimv2*', 'tnt',
+    'tiny_vit', 'vovnet', 'tresnet', 'rexnet', 'resnetv2', 'repghost', 'repvit', 'pvt_v2', 'nextvit', 'nest',
+    'mambaout', 'inception_next', 'inception_v4', 'hgnet', 'gcvit', 'focalnet', 'efficientformer_v2', 'edgenext',
+    'davit', 'rdnet', 'convnext', 'pit', 'starnet', 'shvit', 'fasternet', 'swiftformer', 'ghostnet', 'naflexvit'
 ]
 
 # transformer / hybrid models don't support full set of spatial / feature APIs and/or have spatial output.
 NON_STD_FILTERS = [
-    'vit_*', 'tnt_*', 'pit_*', 'coat_*', 'cait_*', '*mixer_*', 'gmlp_*', 'resmlp_*', 'twins_*',
-    'convit_*', 'levit*', 'visformer*', 'deit*', 'xcit_*', 'crossvit_*', 'beit*', 'aimv2*',
+    'vit_*', 'naflexvit*', 'tnt_*', 'pit_*', 'coat_*', 'cait_*', '*mixer_*', 'gmlp_*', 'resmlp_*', 'twins_*',
+    'convit_*', 'levit*', 'visformer*', 'deit*', 'xcit_*', 'crossvit_*', 'beit*', 'aimv2*', 'swiftformer_*',
     'poolformer_*', 'volo_*', 'sequencer2d_*', 'mvitv2*', 'gcvit*', 'efficientformer*', 'sam_hiera*',
     'eva_*', 'flexivit*', 'eva02*', 'samvit_*', 'efficientvit_m*', 'tiny_vit_*', 'hiera_*', 'vitamin*', 'test_vit*',
 ]
@@ -78,7 +81,7 @@ else:
     EXCLUDE_FILTERS = ['*enormous*']
     NON_STD_EXCLUDE_FILTERS = ['*gigantic*', '*enormous*', '*_3b_*']
 
-EXCLUDE_JIT_FILTERS = ['hiera_*']
+EXCLUDE_JIT_FILTERS = ['hiera_*', '*naflex*']
 
 TARGET_FWD_SIZE = MAX_FWD_SIZE = 384
 TARGET_BWD_SIZE = 128
@@ -142,7 +145,7 @@ def test_model_inference(model_name, batch_size):
         owl_tensors = safetensors.torch.load_file(os.path.join(temp_dir, 'test', 'owl_tensors.safetensors'))
         test_owl = Image.open(os.path.join(temp_dir, 'test', 'test_owl.jpg'))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         rand_output = model(rand_tensors['input'])
         rand_features = model.forward_features(rand_tensors['input'])
         rand_pre_logits = model.forward_head(rand_features, pre_logits=True)
@@ -183,6 +186,18 @@ def test_model_forward(model_name, batch_size):
     assert outputs.shape[0] == batch_size
     assert not torch.isnan(outputs).any(), 'Output included NaNs'
 
+    # Test that grad-checkpointing, if supported, doesn't cause model failures or change in output
+    try:
+        model.set_grad_checkpointing()
+    except:
+        # throws if not supported, that's fine
+        pass
+    else:
+        outputs2 = model(inputs)
+        if isinstance(outputs, tuple):
+            outputs2 = torch.cat(outputs2)
+        assert torch.allclose(outputs, outputs2, rtol=1e-4, atol=1e-5), 'Output does not match'
+
 
 @pytest.mark.base
 @pytest.mark.timeout(timeout120)
@@ -195,6 +210,7 @@ def test_model_backward(model_name, batch_size):
         pytest.skip("Fixed input size model > limit.")
 
     model = create_model(model_name, pretrained=False, num_classes=42)
+    encoder_only = model.num_classes == 0  # FIXME better approach?
     num_params = sum([x.numel() for x in model.parameters()])
     model.train()
 
@@ -209,7 +225,12 @@ def test_model_backward(model_name, batch_size):
         assert x.grad is not None, f'No gradient for {n}'
     num_grad = sum([x.grad.numel() for x in model.parameters() if x.grad is not None])
 
-    assert outputs.shape[-1] == 42
+    if encoder_only:
+        output_fmt = getattr(model, 'output_fmt', 'NCHW')
+        feat_axis = get_channel_dim(output_fmt)
+        assert outputs.shape[feat_axis] == model.num_features, f'unpooled feature dim {outputs.shape[feat_axis]} != model.num_features {model.num_features}'
+    else:
+        assert outputs.shape[-1] == 42
     assert num_params == num_grad, 'Some parameters are missing gradients'
     assert not torch.isnan(outputs).any(), 'Output included NaNs'
 
@@ -218,6 +239,7 @@ def test_model_backward(model_name, batch_size):
 EARLY_POOL_MODELS = (
     timm.models.EfficientVit,
     timm.models.EfficientVitLarge,
+    timm.models.FasterNet,
     timm.models.HighPerfGpuNet,
     timm.models.GhostNet,
     timm.models.MetaNeXt, # InceptionNeXt
@@ -265,6 +287,7 @@ def test_model_default_cfgs(model_name, batch_size):
 
         # test forward after deleting the classifier, output should be poooled, size(-1) == model.num_features
         model.reset_classifier(0)
+        assert model.num_classes == 0, f'Expected num_classes to be 0 after reset_classifier(0), but got {model.num_classes}'
         model.to(torch_device)
         outputs = model.forward(input_tensor)
         assert len(outputs.shape) == 2
@@ -339,6 +362,7 @@ def test_model_default_cfgs_non_std(model_name, batch_size):
 
     # test forward after deleting the classifier, output should be poooled, size(-1) == model.num_features
     model.reset_classifier(0)
+    assert model.num_classes == 0, f'Expected num_classes to be 0 after reset_classifier(0), but got {model.num_classes}'
     model.to(torch_device)
     outputs = model.forward(input_tensor)
     if isinstance(outputs,  (tuple, list)):
@@ -506,8 +530,9 @@ def test_model_forward_intermediates(model_name, batch_size):
     spatial_axis = get_spatial_dim(output_fmt)
     import math
 
+    inpt = torch.randn((batch_size, *input_size))
     output, intermediates = model.forward_intermediates(
-        torch.randn((batch_size, *input_size)),
+        inpt,
         output_fmt=output_fmt,
     )
     assert len(expected_channels) == len(intermediates)
@@ -518,6 +543,23 @@ def test_model_forward_intermediates(model_name, batch_size):
         assert o.shape[spatial_axis[1]] <= math.ceil(spatial_size[1] / r) + 1
         assert o.shape[0] == batch_size
         assert not torch.isnan(o).any()
+
+    output2 = model.forward_features(inpt)
+    assert torch.allclose(output, output2)
+
+    # Test that grad-checkpointing, if supported
+    try:
+        model.set_grad_checkpointing()
+    except:
+        # throws if not supported, that's fine
+        pass
+    else:
+        output3, _ = model.forward_intermediates(
+            inpt,
+            output_fmt=output_fmt,
+        )
+        assert torch.allclose(output, output3, rtol=1e-4, atol=1e-5), 'Output does not match'
+
 
 
 def _create_fx_model(model, train=False):
@@ -589,7 +631,7 @@ def test_model_forward_fx(model_name, batch_size):
     input_size = _get_input_size(model=model, target=TARGET_FWD_FX_SIZE)
     if max(input_size) > MAX_FWD_FX_SIZE:
         pytest.skip("Fixed input size model > limit.")
-    with torch.no_grad():
+    with torch.inference_mode():
         inputs = torch.randn((batch_size, *input_size))
         outputs = model(inputs)
         if isinstance(outputs, tuple):
@@ -669,7 +711,7 @@ if 'GITHUB_ACTIONS' not in os.environ:
         model.eval()
 
         model = torch.jit.script(_create_fx_model(model))
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = tuple(model(torch.randn((batch_size, *input_size))).values())
             if isinstance(outputs, tuple):
                 outputs = torch.cat(outputs)
@@ -700,7 +742,7 @@ if 'GITHUB_ACTIONS' not in os.environ:
         model.eval()
 
         model = torch.jit.script(model)
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(torch.randn((batch_size, *input_size)))
 
         assert isinstance(outputs, list)

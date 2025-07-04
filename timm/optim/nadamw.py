@@ -3,6 +3,10 @@
 Based on simplified algorithm in https://github.com/mlcommons/algorithmic-efficiency/tree/main/baselines/nadamw
 
 Added multi-tensor (foreach) path.
+
+References for added functionality:
+    Cautious Optimizers: https://arxiv.org/abs/2411.16085
+    Why Gradients Rapidly Increase Near the End of Training: https://arxiv.org/abs/2506.02285
 """
 import math
 from typing import List, Optional, Tuple
@@ -32,6 +36,7 @@ class NAdamW(torch.optim.Optimizer):
         eps: term added to the denominator to improve numerical stability
         weight_decay: weight decay coefficient
         caution: enable caution
+        corrected_weight_decay: apply corrected weight decay (lr**2 / max_lr)
     """
 
     def __init__(
@@ -42,6 +47,7 @@ class NAdamW(torch.optim.Optimizer):
             eps: float = 1e-8,
             weight_decay: float = 1e-2,
             caution: bool = False,
+            corrected_weight_decay: bool = False,
             maximize: bool = False,
             foreach: Optional[bool] = None,
             capturable: bool = False,
@@ -62,6 +68,7 @@ class NAdamW(torch.optim.Optimizer):
             eps=eps,
             weight_decay=weight_decay,
             caution=caution,
+            corrected_weight_decay=corrected_weight_decay,
             foreach=foreach,
             maximize=maximize,
             capturable=capturable,
@@ -77,6 +84,7 @@ class NAdamW(torch.optim.Optimizer):
                 s['step'] = torch.tensor(float(s['step']))
         for group in self.param_groups:
             group.setdefault('caution', False)
+            group.setdefault('corrected_weight_decay', False)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -137,6 +145,7 @@ class NAdamW(torch.optim.Optimizer):
                 caution=group['caution'],
                 maximize=group['maximize'],
                 capturable=group['capturable'],
+                max_lr=self.defaults['lr'] if group['corrected_weight_decay'] else None,
             )
 
         return loss
@@ -158,6 +167,7 @@ def nadamw(
         eps: float,
         caution: bool,
         maximize: bool,
+        max_lr: float,
 ) -> None:
     r"""Functional API that performs NAdamW algorithm computation.
       See NAdamW class for details.
@@ -194,6 +204,7 @@ def nadamw(
         caution=caution,
         maximize=maximize,
         capturable=capturable,
+        max_lr=max_lr,
     )
 
 
@@ -211,7 +222,8 @@ def _single_tensor_nadamw(
         eps: float,
         caution: bool,
         maximize: bool,
-        capturable: bool
+        capturable: bool,
+        max_lr: Optional[float],
 ):
 
     for i, param in enumerate(params):
@@ -224,7 +236,8 @@ def _single_tensor_nadamw(
         step_t += 1
 
         # Perform stepweight decay.
-        param.mul_(1. - lr * weight_decay)
+        wd_scale = lr if max_lr is None else lr ** 2 / max_lr
+        param.mul_(1. - wd_scale * weight_decay)
 
         # Decay the first and second moment running average coefficient.
         exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -293,6 +306,7 @@ def _multi_tensor_nadamw(
         caution: bool,
         maximize: bool,
         capturable: bool,
+        max_lr: Optional[float],
 ):
     if len(params) == 0:
         return
@@ -314,7 +328,8 @@ def _multi_tensor_nadamw(
     torch._foreach_add_(state_steps, 1)
 
     # Perform stepweight decay
-    torch._foreach_mul_(params, 1 - lr * weight_decay)
+    wd_scale = lr if max_lr is None else lr ** 2 / max_lr
+    torch._foreach_mul_(params, 1 -  wd_scale * weight_decay)
 
     # Decay the first and second moment running average coefficient
     torch._foreach_mul_(exp_avgs, beta1)
@@ -360,6 +375,7 @@ def _multi_tensor_nadamw(
             masks = [(m > 0).to(g.dtype) for m, g in zip(masks, grads)]  # capturable?
             mask_scale = [m.mean() for m in masks]
             torch._foreach_maximum_(mask_scale, 1e-3)
+            #torch._foreach_clamp_min_(mask_scale, 1e-3)
             torch._foreach_div_(masks, mask_scale)
             torch._foreach_mul_(exp_avgs, masks)
 
@@ -387,6 +403,7 @@ def _multi_tensor_nadamw(
             masks = [(m > 0).to(g.dtype) for m, g in zip(masks, grads)]
             mask_scale = [m.mean() for m in masks]
             torch._foreach_maximum_(mask_scale, 1e-3)
+            #torch._foreach_clamp_min_(mask_scale, 1e-3)
             torch._foreach_div_(masks, mask_scale)
             torch._foreach_mul_(exp_avgs, masks)
 

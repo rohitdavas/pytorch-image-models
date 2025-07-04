@@ -24,7 +24,7 @@ from torch.jit import Final
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
-from ._manipulate import checkpoint_seq
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import generate_default_cfgs, register_model
 
 # model_registry will add each entrypoint fn to this
@@ -364,7 +364,7 @@ class VisionTransformerSAM(nn.Module):
             img_size: Input image size.
             patch_size: Patch size.
             in_chans: Number of image input channels.
-            num_classes: Mumber of classes for classification head.
+            num_classes: Number of classes for classification head.
             global_pool: Type of global pooling for final sequence (default: 'token').
             embed_dim: Transformer embedding dimension.
             depth: Depth of transformer.
@@ -537,6 +537,7 @@ class VisionTransformerSAM(nn.Module):
         return self.head
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+        self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
 
     def forward_intermediates(
@@ -578,7 +579,10 @@ class VisionTransformerSAM(nn.Module):
         else:
             blocks = self.blocks[:max_index + 1]
         for i, blk in enumerate(blocks):
-            x = blk(x)
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(blk, x)
+            else:
+                x = blk(x)
             if i in take_indices:
                 # make output BCHW
                 if norm:
@@ -667,7 +671,7 @@ def _cfg(url='', **kwargs):
 
 default_cfgs = generate_default_cfgs({
 
-    # Segment-Anyhing Model (SAM) pretrained - https://github.com/facebookresearch/segment-anything (no classifier head, for fine-tune/features only)
+    # Segment-Anything Model (SAM) pretrained - https://github.com/facebookresearch/segment-anything (no classifier head, for fine-tune/features only)
     'samvit_base_patch16.sa1b': _cfg(
         url='https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth',
         hf_hub_id='timm/',
